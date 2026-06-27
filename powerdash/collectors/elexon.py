@@ -133,11 +133,87 @@ class ElexonClient:
         }
         return _records_to_df(self._get("/generation/outturn/interconnectors", params))
 
-    # --- Balancing mechanism --------------------------------------------
+    # --- Generic dataset stream ----------------------------------------
 
-    def bid_offer_acceptances(self, settlement_date: str | date) -> pd.DataFrame:
-        path = f"/balancing/acceptances/all/{_to_date(settlement_date)}"
-        return _records_to_df(self._get(path))
+    def dataset(self, code: str, from_dt: datetime, to_dt: datetime,
+                **extra: Any) -> pd.DataFrame:
+        """Generic accessor for /datasets/{code}/stream endpoints."""
+        params: dict[str, Any] = {
+            "from": from_dt.isoformat(),
+            "to": to_dt.isoformat(),
+            "format": "json",
+            **extra,
+        }
+        payload = self._get(f"/datasets/{code.upper()}/stream", params)
+        rows = payload if isinstance(payload, list) else (
+            payload.get("data", []) if isinstance(payload, dict) else []
+        )
+        df = pd.DataFrame(rows)
+        for col in df.columns:
+            if "time" in col.lower() or col.lower().endswith("date"):
+                df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
+        return df
+
+    # --- Wholesale prices (MID dataset) --------------------------------
+
+    def market_index_data(self, from_dt: datetime, to_dt: datetime,
+                           provider: str | None = None) -> pd.DataFrame:
+        """Market Index Data (MID): hourly wholesale reference prices.
+
+        Providers seen on this feed:
+        - ``APXMIDP`` — APX/EPEX UK day-ahead hourly auction (GBP/MWh)
+        - ``N2EXMIDP`` — Nord Pool N2EX day-ahead
+        """
+        df = self.dataset("MID", from_dt, to_dt)
+        if provider and not df.empty and "dataProvider" in df.columns:
+            df = df[df["dataProvider"] == provider].copy()
+        return df
+
+    def day_ahead_epex(self, from_dt: datetime, to_dt: datetime) -> pd.DataFrame:
+        """Day-Ahead wholesale electricity price (GBP/MWh) from EPEX (APXMIDP)."""
+        return self.market_index_data(from_dt, to_dt, provider="APXMIDP")
+
+    def day_ahead_n2ex(self, from_dt: datetime, to_dt: datetime) -> pd.DataFrame:
+        """Day-Ahead wholesale electricity price (GBP/MWh) from N2EX (N2EXMIDP)."""
+        return self.market_index_data(from_dt, to_dt, provider="N2EXMIDP")
+
+    # --- Balancing Mechanism -------------------------------------------
+
+    def bid_offer_data(self, from_dt: datetime, to_dt: datetime) -> pd.DataFrame:
+        """BOD: physical Bid / Offer prices and volumes per BMU per period."""
+        return self.dataset("BOD", from_dt, to_dt)
+
+    def bid_offer_acceptances(self, from_dt: datetime, to_dt: datetime) -> pd.DataFrame:
+        """BOALF: Bid Offer Acceptances Level Flagged.
+
+        Each row is a NESO instruction to a unit — `levelTo` is the MW
+        target, `soFlag` marks system actions, `storFlag` marks STOR.
+        """
+        return self.dataset("BOALF", from_dt, to_dt)
+
+    # --- BSAD (Balancing Services Adjustment Data) ----------------------
+
+    def net_bsad(self, from_dt: datetime, to_dt: datetime) -> pd.DataFrame:
+        """NETBSAD: net buy/sell price adjustments per settlement period."""
+        return self.dataset("NETBSAD", from_dt, to_dt)
+
+    def disaggregated_bsad(self, from_dt: datetime, to_dt: datetime) -> pd.DataFrame:
+        """DISBSAD: disaggregated balancing services adjustment items.
+
+        Includes STOR actions, system-flagged trades and other
+        bilateral-balancing volumes that don't flow through the BM.
+        """
+        return self.dataset("DISBSAD", from_dt, to_dt)
+
+    # --- System actions / warnings -------------------------------------
+
+    def system_warnings(self, from_dt: datetime, to_dt: datetime) -> pd.DataFrame:
+        """SYS_WARN: NESO system warnings (SO-SO trades, capacity, etc)."""
+        return self.dataset("SYSWARN", from_dt, to_dt)
+
+    def reserve_utilisation(self, from_dt: datetime, to_dt: datetime) -> pd.DataFrame:
+        """RURE: reserve utilisation rates (response curve parameters)."""
+        return self.dataset("RURE", from_dt, to_dt)
 
 
 def settlement_period_to_time(date_str: str, settlement_period: int) -> datetime:

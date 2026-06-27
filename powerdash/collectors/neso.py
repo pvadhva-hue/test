@@ -30,6 +30,10 @@ RESOURCES = {
     "dc_dm_dr_results": "888e5be0-3a1f-4d2f-b66e-7e3d6d96a8e2",
     # Short Term Operating Reserve tendered results
     "stor_results": "65d0bf57-7c1b-44ed-b3a3-3e2b9a5a0e21",
+    # Quick Reserve auction results
+    "quick_reserve": "5664c4dd-c2fd-4e9a-b29b-79b9f8b8b35a",
+    # Balancing Reserve auction results
+    "balancing_reserve": "7b5e7b03-8a39-4f7f-9ec9-2d1f56c3b9f6",
     # Historic Demand Data
     "historic_demand": "bb44a1b5-75b1-4db2-8491-257f23385006",
 }
@@ -102,7 +106,18 @@ class NesoClient:
         resource_id: str | None = None,
         limit: int = 2000,
     ) -> pd.DataFrame:
-        """Frequency response auction results (DC/DM/DR low and high)."""
+        """Frequency response auction results (DC/DM/DR low and high).
+
+        ``product`` is matched against the dataset's "service" /
+        "product" column. Pass a known resource id directly to query
+        Quick Reserve or Balancing Reserve auctions:
+
+        - Dynamic Containment: ``dc`` (low + high)
+        - Dynamic Moderation:  ``dm``
+        - Dynamic Regulation:  ``dr``
+        - Quick Reserve:       resource ``quick_reserve``
+        - Balancing Reserve:   resource ``balancing_reserve``
+        """
         rid = resource_id or RESOURCES["dc_dm_dr_results"]
         df = self.datastore_search(rid, limit=limit)
         if df.empty:
@@ -112,6 +127,12 @@ class NesoClient:
             mask = df[prod_cols[0]].astype(str).str.lower().str.contains(product.lower())
             df = df[mask]
         return df
+
+    def quick_reserve_auctions(self, limit: int = 2000) -> pd.DataFrame:
+        return self.datastore_search(RESOURCES["quick_reserve"], limit=limit)
+
+    def balancing_reserve_auctions(self, limit: int = 2000) -> pd.DataFrame:
+        return self.datastore_search(RESOURCES["balancing_reserve"], limit=limit)
 
     def historic_demand(self, limit: int = 5000) -> pd.DataFrame:
         return self.datastore_search(RESOURCES["historic_demand"], limit=limit)
