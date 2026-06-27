@@ -71,23 +71,46 @@ class ElexonClient:
     # --- Demand ----------------------------------------------------------
 
     def demand_outturn(self, settlement_date: str | date) -> pd.DataFrame:
-        path = f"/demand/actual/total/{_to_date(settlement_date)}"
-        return _records_to_df(self._get(path))
+        """Initial and Transmission System demand outturn (INDO / ITSDO)."""
+        d = _to_date(settlement_date)
+        params = {"settlementDateFrom": d, "settlementDateTo": d, "format": "json"}
+        return _records_to_df(self._get("/demand/outturn", params))
 
     def demand_day_ahead(self, settlement_date: str | date) -> pd.DataFrame:
-        path = f"/forecast/demand/day-ahead/{_to_date(settlement_date)}"
-        return _records_to_df(self._get(path))
+        d = _to_date(settlement_date)
+        params = {"settlementDateFrom": d, "settlementDateTo": d, "format": "json"}
+        return _records_to_df(self._get("/forecast/demand/day-ahead", params))
 
     # --- Generation ------------------------------------------------------
 
     def generation_by_fuel(self, from_dt: datetime, to_dt: datetime) -> pd.DataFrame:
-        """Actual MW per fuel type at 30 min resolution."""
+        """Actual MW per fuel type at 30 min resolution (AGPT).
+
+        The raw payload nests `{startTime, settlementPeriod, data: [{psrType,
+        quantity, ...}]}` — this flattens into one row per (time, fuel).
+        """
         params = {
             "from": from_dt.isoformat(),
             "to": to_dt.isoformat(),
             "format": "json",
         }
-        return _records_to_df(self._get("/generation/actual/per-type", params))
+        payload = self._get("/generation/actual/per-type", params)
+        if not isinstance(payload, dict):
+            return pd.DataFrame()
+        rows: list[dict] = []
+        for snap in payload.get("data", []) or []:
+            for inner in snap.get("data", []) or []:
+                rows.append({
+                    "startTime": snap.get("startTime"),
+                    "settlementPeriod": snap.get("settlementPeriod"),
+                    "psrType": inner.get("psrType"),
+                    "businessType": inner.get("businessType"),
+                    "quantity": inner.get("quantity"),
+                })
+        df = pd.DataFrame(rows)
+        if not df.empty:
+            df["startTime"] = pd.to_datetime(df["startTime"], utc=True, errors="coerce")
+        return df
 
     def wind_solar_forecast(self, from_dt: datetime, to_dt: datetime) -> pd.DataFrame:
         """Day-ahead wind and solar generation forecast (MW)."""
