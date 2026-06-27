@@ -3,6 +3,7 @@ pandas>=2.2
 numpy>=1.26
 requests>=2.32
 plotly>=5.22
+matplotlib>=3.8
 python-dateutil>=2.9
 pytz>=2024.1
 pytest>=8.2
