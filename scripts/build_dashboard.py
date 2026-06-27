@@ -11,8 +11,6 @@ Sections rendered:
 - Generation mix by fuel
 - Wholesale Market Index (Elexon MID): EPEX (APX) and N2EX day-ahead
 - Balancing Mechanism: bid / offer prices and acceptance volumes
-- Disaggregated BSAD (DISBSAD) by service
-- NESO system warnings (BM System Action notices)
 - Ancillary auctions (DC / DM / DR / Quick Reserve / Balancing Reserve)
   rendered only when the NESO portal is reachable
 
@@ -76,10 +74,6 @@ def fetch(target: date) -> dict[str, pd.DataFrame]:
         "mid_n2ex": _safe(el.day_ahead_n2ex, start, end),
         "bod": _safe(el.bid_offer_data, start, end),
         "boalf": _safe(el.bid_offer_acceptances, start, end),
-        "netbsad": _safe(el.net_bsad, start, end),
-        "disbsad": _safe(el.disaggregated_bsad, start, end),
-        "syswarn": _safe(el.system_warnings,
-                          start - timedelta(days=1), end),
     }
     # NESO ancillary auctions — single EAC summary feed covers all
     # response / reserve products (DC, DM, DR, BR, QR, SR).
@@ -279,61 +273,6 @@ def _fig_bm_bid_offer(data: dict[str, pd.DataFrame]) -> go.Figure:
     return fig
 
 
-def _fig_bsad(data: dict[str, pd.DataFrame]) -> go.Figure:
-    """DISBSAD volumes & costs broken down by service."""
-    fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
-        row_heights=[0.5, 0.5],
-        subplot_titles=("DISBSAD volumes (MWh) by service",
-                        "DISBSAD costs (£) by service"),
-    )
-    bsad = data["disbsad"]
-    if bsad.empty:
-        fig.add_annotation(text="DISBSAD: no data for window",
-                            x=0.5, y=0.5, xref="paper", yref="paper",
-                            showarrow=False)
-    else:
-        bsad = bsad.copy()
-        # Map settlement period to a time stamp within the day
-        if "settlementDate" in bsad.columns:
-            bsad["startTime"] = pd.to_datetime(bsad["settlementDate"],
-                                                utc=True, errors="coerce") + \
-                pd.to_timedelta((bsad["settlementPeriod"] - 1) * 30, unit="m")
-        else:
-            bsad["startTime"] = pd.NaT
-        bsad["service"] = bsad["service"].fillna("Unknown")
-        vol = (bsad.groupby(["startTime", "service"])["volume"].sum()
-                .unstack(fill_value=0))
-        cost = (bsad.groupby(["startTime", "service"])["cost"].sum()
-                 .unstack(fill_value=0))
-        palette = ["#e74c3c", "#3498db", "#16a085", "#f39c12", "#8e44ad",
-                   "#34495e", "#95a5a6"]
-        for i, svc in enumerate(vol.columns):
-            colour = palette[i % len(palette)]
-            fig.add_trace(go.Bar(x=vol.index, y=vol[svc], name=f"vol {svc}",
-                                  marker_color=colour,
-                                  hovertemplate="%{x|%H:%M}<br>%{y:.1f} MWh<extra>"+svc+"</extra>"),
-                          row=1, col=1)
-            fig.add_trace(go.Bar(x=cost.index, y=cost[svc],
-                                  name=f"cost {svc}", marker_color=colour,
-                                  showlegend=False,
-                                  hovertemplate="%{x|%H:%M}<br>£%{y:,.0f}<extra>"+svc+"</extra>"),
-                          row=2, col=1)
-        fig.update_layout(barmode="relative")
-
-    fig.update_yaxes(title_text="MWh", row=1, col=1)
-    fig.update_yaxes(title_text="£", row=2, col=1)
-    fig.update_xaxes(title_text="Time (UTC)", row=2, col=1)
-    fig.update_layout(
-        title=dict(text="<b>BSAD — non-BM balancing volumes & costs by service</b>",
-                    x=0.01, xanchor="left"),
-        height=680, margin=dict(l=60, r=30, t=70, b=40),
-        hovermode="x unified", template="plotly_white",
-        legend=dict(orientation="h", y=-0.12, x=0.5, xanchor="center", font=dict(size=10)),
-    )
-    return fig
-
-
 PRODUCT_COLOURS = {
     # Response colours (red family — high vs low frequency)
     "DCH": "#c0392b", "DCL": "#e67e22",
@@ -445,7 +384,6 @@ def kpi_strip(data: dict[str, pd.DataFrame], target: date) -> str:
     dem = data["demand"]
     gen = data["generation"]
     epex = data["mid_epex"]
-    bsad = data["disbsad"]
 
     sells = sp.get("systemSellPrice", pd.Series(dtype=float)).dropna()
     p_mean = sells.mean() if len(sells) else float("nan")
@@ -468,9 +406,6 @@ def kpi_strip(data: dict[str, pd.DataFrame], target: date) -> str:
     else:
         ren_pct = float("nan")
 
-    bsad_cost = pd.to_numeric(bsad["cost"], errors="coerce").sum() \
-        if not bsad.empty else float("nan")
-
     cards = [
         ("Day mean SIP", f"£{p_mean:,.0f}/MWh"),
         ("Peak SIP", f"£{p_peak:,.0f}/MWh"),
@@ -478,7 +413,6 @@ def kpi_strip(data: dict[str, pd.DataFrame], target: date) -> str:
         ("EPEX DA mean", f"£{epex_mean:,.0f}/MWh"),
         ("Peak ITSDO", f"{d_peak:,.1f} GW"),
         ("Avg renewables share", f"{ren_pct:.1f}%"),
-        ("Day BSAD cost", f"£{bsad_cost:,.0f}"),
     ]
     cards_html = "".join(
         f'<div class="kpi"><div class="kpi-label">{label}</div>'
@@ -486,27 +420,6 @@ def kpi_strip(data: dict[str, pd.DataFrame], target: date) -> str:
         for label, value in cards
     )
     return f'<div class="kpi-strip">{cards_html}</div>'
-
-
-def render_warnings(data: dict[str, pd.DataFrame]) -> str:
-    sw = data["syswarn"]
-    if sw.empty:
-        return ('<div class="card"><h3>System warnings (BM System Action)</h3>'
-                '<p class="muted">No warnings in window.</p></div>')
-    rows = []
-    for _, r in sw.sort_values("publishTime", ascending=False).head(12).iterrows():
-        txt = (str(r.get("warningText", "")) or "")[:600].replace("\r", "")
-        rows.append(
-            f'<tr><td class="nowrap">{r.get("publishTime","")}</td>'
-            f'<td class="nowrap">{r.get("warningType","")}</td>'
-            f'<td>{txt}</td></tr>'
-        )
-    return (
-        '<div class="card"><h3>System warnings (BM System Action)</h3>'
-        '<table class="warn"><thead><tr><th>Published</th>'
-        '<th>Type</th><th>Text</th></tr></thead>'
-        f'<tbody>{"".join(rows)}</tbody></table></div>'
-    )
 
 
 PAGE_TEMPLATE = """<!doctype html>
@@ -556,9 +469,7 @@ PAGE_TEMPLATE = """<!doctype html>
   <div class="chart-card">{fig_main}</div>
   <div class="chart-card">{fig_wholesale}</div>
   <div class="chart-card">{fig_bm}</div>
-  <div class="chart-card">{fig_bsad}</div>
   {fig_ancillary}
-  {warnings}
 </main>
 <footer>Generated {generated_at} UTC · static HTML, no server required</footer>
 </body>
@@ -586,9 +497,6 @@ def main() -> None:
         config={"displaylogo": False})
     bm_fig = _fig_bm_bid_offer(data).to_html(
         include_plotlyjs=False, full_html=False, div_id="dash-bm",
-        config={"displaylogo": False})
-    bsad_fig = _fig_bsad(data).to_html(
-        include_plotlyjs=False, full_html=False, div_id="dash-bsad",
         config={"displaylogo": False})
     anc = _fig_ancillary(data)
     anc_sum = _fig_ancillary_summary(data)
@@ -618,8 +526,7 @@ def main() -> None:
         target=target, extra_sources=extra_sources,
         kpis=kpi_strip(data, target),
         fig_main=main_fig, fig_wholesale=wholesale_fig,
-        fig_bm=bm_fig, fig_bsad=bsad_fig, fig_ancillary=anc_html,
-        warnings=render_warnings(data),
+        fig_bm=bm_fig, fig_ancillary=anc_html,
         generated_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
     )
     out_path = Path(args.out)
