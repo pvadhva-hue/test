@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+.env
+.DS_Store
+.cache/
+.pytest_cache/
+.streamlit/secrets.toml
+data/cache/
+*.parquet
+*.sqlite
+.ipynb_checkpoints/
+node_modules/
