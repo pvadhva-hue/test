@@ -81,16 +81,17 @@ def fetch(target: date) -> dict[str, pd.DataFrame]:
         "syswarn": _safe(el.system_warnings,
                           start - timedelta(days=1), end),
     }
-    # NESO is optional — only included if the network is reachable
+    # NESO ancillary auctions — single EAC summary feed covers all
+    # response / reserve products (DC, DM, DR, BR, QR, SR).
     try:
         neso = NesoClient()
-        out["dc"] = _safe(neso.ancillary_results, "dc")
-        out["dm"] = _safe(neso.ancillary_results, "dm")
-        out["dr"] = _safe(neso.ancillary_results, "dr")
-        out["quick_reserve"] = _safe(neso.quick_reserve_auctions)
-        out["balancing_reserve"] = _safe(neso.balancing_reserve_auctions)
+        out["eac"] = _safe(
+            neso.eac_auction_results,
+            from_date=(target - timedelta(days=30)).isoformat(),
+        )
     except Exception as exc:  # noqa: BLE001
-        print(f"  WARN: NESO unreachable, ancillary panels omitted: {exc}")
+        print(f"  WARN: NESO unreachable: {exc}")
+        out["eac"] = pd.DataFrame()
     return out
 
 
@@ -333,44 +334,108 @@ def _fig_bsad(data: dict[str, pd.DataFrame]) -> go.Figure:
     return fig
 
 
+PRODUCT_COLOURS = {
+    # Response colours (red family — high vs low frequency)
+    "DCH": "#c0392b", "DCL": "#e67e22",
+    "DMH": "#d35400", "DML": "#e74c3c",
+    "DRH": "#8e44ad", "DRL": "#9b59b6",
+    # Reserve colours (blue/green family)
+    "PBR": "#2980b9", "NBR": "#3498db",
+    "PQR": "#16a085", "NQR": "#1abc9c",
+    "PSR": "#34495e", "NSR": "#7f8c8d",
+}
+
+
 def _fig_ancillary(data: dict[str, pd.DataFrame]) -> go.Figure | None:
-    """Ancillary auction results — DC/DM/DR/Quick Reserve/Balancing Reserve."""
-    frames = {
-        "Dynamic Containment": data.get("dc", pd.DataFrame()),
-        "Dynamic Moderation":  data.get("dm", pd.DataFrame()),
-        "Dynamic Regulation":  data.get("dr", pd.DataFrame()),
-        "Quick Reserve":       data.get("quick_reserve", pd.DataFrame()),
-        "Balancing Reserve":   data.get("balancing_reserve", pd.DataFrame()),
-    }
-    frames = {k: v for k, v in frames.items() if not v.empty}
-    if not frames:
+    """EAC clearing prices for all response & reserve products."""
+    eac = data.get("eac")
+    if eac is None or eac.empty:
         return None
 
-    fig = go.Figure()
-    palette = ["#c0392b", "#16a085", "#2980b9", "#f39c12", "#8e44ad"]
-    for i, (name, df) in enumerate(frames.items()):
-        time_col = next((c for c in df.columns
-                          if "time" in c.lower() or "date" in c.lower()), None)
-        price_col = next((c for c in df.columns
-                           if "clear" in c.lower() and "price" in c.lower()), None)
-        if not price_col:
-            price_col = next((c for c in df.columns if c.lower() == "price"), None)
-        if not time_col or not price_col:
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1,
+        subplot_titles=(
+            "Frequency response auctions (DC / DM / DR — High & Low)",
+            "Reserve auctions (Balancing / Quick / Slow — Positive & Negative)",
+        ),
+    )
+    response = ["DCH", "DCL", "DMH", "DML", "DRH", "DRL"]
+    reserve = ["PBR", "NBR", "PQR", "NQR", "PSR", "NSR"]
+
+    for code in response:
+        df = (eac[eac["auctionProduct"] == code]
+               .sort_values("deliveryStart"))
+        if df.empty:
             continue
-        view = df[[time_col, price_col]].dropna().sort_values(time_col)
         fig.add_trace(go.Scatter(
-            x=view[time_col], y=pd.to_numeric(view[price_col], errors="coerce"),
-            mode="lines+markers", name=name,
-            line=dict(color=palette[i % len(palette)], width=2),
-            hovertemplate=f"{name}<br>%{{x|%Y-%m-%d %H:%M}}<br>£%{{y:.2f}}/MW/h<extra></extra>",
-        ))
+            x=df["deliveryStart"], y=df["clearingPrice"],
+            mode="lines+markers", name=code,
+            line=dict(color=PRODUCT_COLOURS.get(code, "#999"), width=1.6),
+            marker=dict(size=4),
+            customdata=df["clearedVolume"],
+            hovertemplate=(f"{code} — {df['productLabel'].iloc[0]}<br>"
+                            "%{x|%Y-%m-%d %H:%M}<br>"
+                            "£%{y:.2f}/MW/h<br>%{customdata:.0f} MW<extra></extra>"),
+        ), row=1, col=1)
+
+    for code in reserve:
+        df = (eac[eac["auctionProduct"] == code]
+               .sort_values("deliveryStart"))
+        if df.empty:
+            continue
+        fig.add_trace(go.Scatter(
+            x=df["deliveryStart"], y=df["clearingPrice"],
+            mode="lines+markers", name=code,
+            line=dict(color=PRODUCT_COLOURS.get(code, "#999"), width=1.6),
+            marker=dict(size=4),
+            customdata=df["clearedVolume"],
+            hovertemplate=(f"{code} — {df['productLabel'].iloc[0]}<br>"
+                            "%{x|%Y-%m-%d %H:%M}<br>"
+                            "£%{y:.2f}/MW/h<br>%{customdata:.0f} MW<extra></extra>"),
+        ), row=2, col=1)
+
+    fig.update_yaxes(title_text="£/MW/h", row=1, col=1)
+    fig.update_yaxes(title_text="£/MW/h", row=2, col=1)
+    fig.update_xaxes(title_text="Delivery start (UTC)", row=2, col=1)
     fig.update_layout(
-        title=dict(text="<b>Ancillary auction clearing prices (NESO)</b>",
+        title=dict(text="<b>Ancillary auction clearing prices — NESO EAC</b>",
                     x=0.01, xanchor="left"),
-        height=420, margin=dict(l=60, r=30, t=60, b=40),
-        xaxis_title="EFA / settlement", yaxis_title="£/MW/h",
+        height=720, margin=dict(l=60, r=30, t=70, b=40),
         hovermode="x unified", template="plotly_white",
-        legend=dict(orientation="h", y=-0.18, x=0.5, xanchor="center"),
+        legend=dict(orientation="h", y=-0.12, x=0.5, xanchor="center",
+                    font=dict(size=10)),
+    )
+    return fig
+
+
+def _fig_ancillary_summary(data: dict[str, pd.DataFrame]) -> go.Figure | None:
+    """Latest 7-day average clearing price by product."""
+    eac = data.get("eac")
+    if eac is None or eac.empty:
+        return None
+    cutoff = eac["deliveryStart"].max() - pd.Timedelta(days=7)
+    recent = eac[eac["deliveryStart"] >= cutoff].copy()
+    if recent.empty:
+        return None
+    summary = (recent.groupby("auctionProduct")
+                .agg(mean_price=("clearingPrice", "mean"),
+                      mean_volume=("clearedVolume", "mean"))
+                .reindex([c for c in PRODUCT_COLOURS if c in
+                          recent["auctionProduct"].unique()]))
+    fig = go.Figure(go.Bar(
+        x=summary.index, y=summary["mean_price"],
+        marker_color=[PRODUCT_COLOURS.get(c, "#999") for c in summary.index],
+        customdata=summary["mean_volume"],
+        text=[f"£{v:.1f}" for v in summary["mean_price"]],
+        textposition="outside",
+        hovertemplate="%{x}<br>mean £%{y:.2f}/MW/h<br>"
+                       "%{customdata:.0f} MW avg cleared<extra></extra>",
+    ))
+    fig.update_layout(
+        title=dict(text="<b>7-day mean clearing price by product</b>",
+                    x=0.01, xanchor="left"),
+        height=320, margin=dict(l=60, r=30, t=60, b=40),
+        yaxis_title="£/MW/h", template="plotly_white",
     )
     return fig
 
@@ -526,13 +591,22 @@ def main() -> None:
         include_plotlyjs=False, full_html=False, div_id="dash-bsad",
         config={"displaylogo": False})
     anc = _fig_ancillary(data)
+    anc_sum = _fig_ancillary_summary(data)
     if anc is not None:
-        anc_html = ('<div class="chart-card">' +
-                    anc.to_html(include_plotlyjs=False, full_html=False,
-                                 div_id="dash-anc",
-                                 config={"displaylogo": False})
-                    + '</div>')
-        extra_sources = " · NESO portal"
+        parts = []
+        if anc_sum is not None:
+            parts.append('<div class="chart-card">' +
+                         anc_sum.to_html(include_plotlyjs=False,
+                                          full_html=False, div_id="dash-anc-sum",
+                                          config={"displaylogo": False}) +
+                         '</div>')
+        parts.append('<div class="chart-card">' +
+                     anc.to_html(include_plotlyjs=False, full_html=False,
+                                  div_id="dash-anc",
+                                  config={"displaylogo": False}) +
+                     '</div>')
+        anc_html = "".join(parts)
+        extra_sources = " · NESO portal (EAC)"
     else:
         anc_html = ('<div class="card"><h3>Ancillary auctions '
                     '(DC / DM / DR / Quick Reserve / Balancing Reserve)</h3>'

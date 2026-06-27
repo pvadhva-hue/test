@@ -23,19 +23,44 @@ BASE_URL = "https://api.neso.energy/api/3/action"
 # Curated resource IDs for the dashboards. These ids are stable but the
 # NESO portal occasionally publishes new versions; override at the call
 # site via the `resource_id` argument if needed.
+# Curated resource IDs (verified live 2026-06-27). The NESO portal
+# occasionally publishes new resource versions; override at the call
+# site via the `resource_id` argument if needed.
 RESOURCES = {
-    # Day-Ahead Hourly Auction prices (N2EX / EPEX) historical archive
-    "da_prices_hourly": "9b1a8e6f-2a3b-44c0-9a3b-7c8f0f3b5b8e",
-    # Dynamic Containment / Moderation / Regulation (low & high) results
-    "dc_dm_dr_results": "888e5be0-3a1f-4d2f-b66e-7e3d6d96a8e2",
-    # Short Term Operating Reserve tendered results
-    "stor_results": "65d0bf57-7c1b-44ed-b3a3-3e2b9a5a0e21",
-    # Quick Reserve auction results
-    "quick_reserve": "5664c4dd-c2fd-4e9a-b29b-79b9f8b8b35a",
-    # Balancing Reserve auction results
-    "balancing_reserve": "7b5e7b03-8a39-4f7f-9ec9-2d1f56c3b9f6",
+    # The single unified Enduring Auction Capability (EAC) results
+    # summary — clearing price and cleared volume per product per EFA
+    # window. Products: DCH/DCL/DMH/DML/DRH/DRL (Response) and
+    # NBR/PBR/NQR/PQR/NSR/PSR (Reserve: Balancing / Quick / Slow,
+    # Negative / Positive).
+    "eac_results_summary": "596f29ac-0387-4ba4-a6d3-95c243140707",
+    "eac_results_by_unit": "a63ab354-7e68-44c2-ad96-c6f920c30e85",
+    "eac_buy_orders":      "1cf68f59-8eb8-4f1d-bccf-11b5a47b24e5",
+    "eac_sell_orders":     "13b511df-d6ec-4143-afb1-0ecc6fd19810",
+    # Quick / Balancing Reserve requirement forecasts
+    "quick_reserve_forecast":     "f012de08-b258-408b-bc41-f885e183f97f",
+    "balancing_reserve_forecast": "019f6fba-4f17-4056-9ef8-31df44ff2e30",
+    # Non-BM reserve availability MW and utilisation price (OBP)
+    "obp_reserve_avail": "6bfe7df0-60aa-462d-94cd-44ac0a4abb2c",
+    # Pre-EAC archive (historical reference only)
+    "dc_dm_dr_legacy_summary": "888e5029-f786-41d2-bc15-cbfd1d285e96",
     # Historic Demand Data
     "historic_demand": "bb44a1b5-75b1-4db2-8491-257f23385006",
+}
+
+# EAC product code -> human label / category
+EAC_PRODUCTS = {
+    "DCH": ("Dynamic Containment (High)", "Response"),
+    "DCL": ("Dynamic Containment (Low)",  "Response"),
+    "DMH": ("Dynamic Moderation (High)",  "Response"),
+    "DML": ("Dynamic Moderation (Low)",   "Response"),
+    "DRH": ("Dynamic Regulation (High)",  "Response"),
+    "DRL": ("Dynamic Regulation (Low)",   "Response"),
+    "PBR": ("Balancing Reserve (Pos)",    "Reserve"),
+    "NBR": ("Balancing Reserve (Neg)",    "Reserve"),
+    "PQR": ("Quick Reserve (Pos)",        "Reserve"),
+    "NQR": ("Quick Reserve (Neg)",        "Reserve"),
+    "PSR": ("Slow Reserve (Pos)",         "Reserve"),
+    "NSR": ("Slow Reserve (Neg)",         "Reserve"),
 }
 
 
@@ -100,39 +125,60 @@ class NesoClient:
                 df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
         return df
 
-    def ancillary_results(
+    def eac_auction_results(
         self,
-        product: str = "dc",
-        resource_id: str | None = None,
-        limit: int = 2000,
+        *,
+        from_date: str | None = None,
+        products: list[str] | None = None,
+        limit: int = 50000,
     ) -> pd.DataFrame:
-        """Frequency response auction results (DC/DM/DR low and high).
+        """EAC summary clearing prices / volumes for response & reserve auctions.
 
-        ``product`` is matched against the dataset's "service" /
-        "product" column. Pass a known resource id directly to query
-        Quick Reserve or Balancing Reserve auctions:
-
-        - Dynamic Containment: ``dc`` (low + high)
-        - Dynamic Moderation:  ``dm``
-        - Dynamic Regulation:  ``dr``
-        - Quick Reserve:       resource ``quick_reserve``
-        - Balancing Reserve:   resource ``balancing_reserve``
+        Returns one row per (auctionProduct, deliveryStart) with the
+        clearing price (£/MW/h) and cleared volume (MW). Use the
+        ``products`` filter to narrow to e.g. ``["DCH", "DCL"]``.
         """
-        rid = resource_id or RESOURCES["dc_dm_dr_results"]
-        df = self.datastore_search(rid, limit=limit)
-        if df.empty:
-            return df
-        prod_cols = [c for c in df.columns if "product" in c.lower() or "service" in c.lower()]
-        if prod_cols:
-            mask = df[prod_cols[0]].astype(str).str.lower().str.contains(product.lower())
-            df = df[mask]
+        if from_date:
+            cond = f"WHERE \"deliveryStart\" >= '{from_date}'"
+        else:
+            cond = ""
+        prod_filter = ""
+        if products:
+            prods = ",".join(f"'{p}'" for p in products)
+            prod_filter = (" AND " if cond else "WHERE ") + \
+                f"\"auctionProduct\" IN ({prods})"
+        sql = (f'SELECT "auctionProduct", "serviceType", "deliveryStart", '
+               f'"deliveryEnd", "clearedVolume", "clearingPrice" '
+               f'FROM "{RESOURCES["eac_results_summary"]}" '
+               f'{cond}{prod_filter} '
+               f'ORDER BY "deliveryStart" DESC LIMIT {limit}')
+        df = self.datastore_sql(sql)
+        if not df.empty:
+            df["deliveryStart"] = pd.to_datetime(df["deliveryStart"],
+                                                  utc=True, errors="coerce")
+            df["deliveryEnd"] = pd.to_datetime(df["deliveryEnd"],
+                                                utc=True, errors="coerce")
+            for col in ("clearingPrice", "clearedVolume"):
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+            df["productLabel"] = df["auctionProduct"].map(
+                lambda p: EAC_PRODUCTS.get(p, (p, ""))[0])
         return df
 
-    def quick_reserve_auctions(self, limit: int = 2000) -> pd.DataFrame:
-        return self.datastore_search(RESOURCES["quick_reserve"], limit=limit)
+    # Backwards-compatible single-product helpers ---------------------
 
-    def balancing_reserve_auctions(self, limit: int = 2000) -> pd.DataFrame:
-        return self.datastore_search(RESOURCES["balancing_reserve"], limit=limit)
+    def ancillary_results(self, product: str = "dc", **_) -> pd.DataFrame:
+        product = product.upper()
+        codes = [p for p in EAC_PRODUCTS if p.startswith(product)]
+        if not codes:
+            codes = [product]
+        return self.eac_auction_results(products=codes)
+
+    def quick_reserve_auctions(self, **_) -> pd.DataFrame:
+        return self.eac_auction_results(products=["PQR", "NQR"])
+
+    def balancing_reserve_auctions(self, **_) -> pd.DataFrame:
+        return self.eac_auction_results(products=["PBR", "NBR"])
 
     def historic_demand(self, limit: int = 5000) -> pd.DataFrame:
         return self.datastore_search(RESOURCES["historic_demand"], limit=limit)
