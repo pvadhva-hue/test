@@ -32,6 +32,10 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from powerdash.collectors import ElexonClient, NesoClient
+from powerdash.services.bess import BatteryConfig
+from powerdash.services.revenue_stack import (
+    StackAssumptions, daily_stack_summary, revenue_stack,
+)
 
 
 FUEL_COLOURS = {
@@ -409,6 +413,84 @@ def _fig_ancillary_summary(data: dict[str, pd.DataFrame]) -> go.Figure | None:
     return fig
 
 
+def _fig_revenue_stack(data: dict[str, pd.DataFrame],
+                        start_date: date, end_date: date,
+                        cfg: BatteryConfig) -> tuple[go.Figure | None,
+                                                       pd.DataFrame,
+                                                       pd.DataFrame]:
+    """BESS revenue stack over the window: daily bars + product mix.
+
+    Returns (figure, per-SP stack df, per-day summary df).
+    """
+    da = data["mid_epex"].copy()
+    if not da.empty and "startTime" in da.columns and "price" in da.columns:
+        da = da[["startTime", "price"]].dropna()
+    else:
+        da = pd.DataFrame(columns=["startTime", "price"])
+
+    sip = data["system_prices"]
+    eac = data.get("eac", pd.DataFrame())
+
+    assump = StackAssumptions(da_capture=0.8, imbalance_capture=0.5)
+    stack = revenue_stack(da, sip, eac, cfg, assumptions=assump,
+                           start=start_date, end=end_date)
+    summary = daily_stack_summary(stack)
+    if summary.empty:
+        return None, stack, summary
+
+    fig = make_subplots(
+        rows=1, cols=2, column_widths=[0.62, 0.38],
+        specs=[[{"type": "bar"}, {"type": "domain"}]],
+        subplot_titles=("Daily revenue by market",
+                        "Ancillary product mix (SPs won)"),
+    )
+    fig.add_trace(go.Bar(
+        x=summary["day"], y=summary["ancillary_gbp"], name="Ancillary",
+        marker_color="#8e44ad",
+        hovertemplate="%{x}<br>£%{y:,.0f}<extra>Ancillary</extra>",
+    ), row=1, col=1)
+    fig.add_trace(go.Bar(
+        x=summary["day"], y=summary["da_gbp"], name="Wholesale DA",
+        marker_color="#2980b9",
+        hovertemplate="%{x}<br>£%{y:,.0f}<extra>Wholesale DA</extra>",
+    ), row=1, col=1)
+    fig.add_trace(go.Bar(
+        x=summary["day"], y=summary["bm_gbp"], name="Imbalance / BM",
+        marker_color="#e67e22",
+        hovertemplate="%{x}<br>£%{y:,.0f}<extra>Imbalance / BM</extra>",
+    ), row=1, col=1)
+
+    if not stack.empty:
+        mix = (stack[stack["chosen_market"] == "ancillary"]
+                ["ancillary_product"].value_counts())
+        colours = [PRODUCT_COLOURS.get(str(p), "#999") for p in mix.index]
+        fig.add_trace(go.Pie(
+            labels=mix.index, values=mix.values, hole=0.4,
+            marker=dict(colors=colours),
+            textinfo="label+percent",
+            hovertemplate="%{label}<br>%{value} settlement periods<extra></extra>",
+        ), row=1, col=2)
+
+    total = summary["total_gbp"].sum()
+    per_mw_day = total / cfg.power_mw / max(len(summary), 1)
+    subtitle = (f"{cfg.power_mw:.0f} MW / {cfg.duration_h:g}h · "
+                f"η<sub>rt</sub>={cfg.round_trip_efficiency:.0%} · "
+                f"7-day total £{total:,.0f} "
+                f"(£{per_mw_day:,.0f}/MW/day · "
+                f"~£{per_mw_day * 365 / 1000:,.0f}k/MW/yr extrapolated)")
+    fig.update_layout(
+        title=dict(text=f"<b>BESS revenue stack</b><br>"
+                         f"<sup>{subtitle}</sup>",
+                    x=0.01, xanchor="left"),
+        barmode="stack", height=460,
+        margin=dict(l=60, r=30, t=90, b=40),
+        template="plotly_white",
+        legend=dict(orientation="h", y=-0.15, x=0.25, xanchor="center"),
+    )
+    fig.update_yaxes(title_text="£ / day", row=1, col=1)
+    return fig, stack, summary
+
+
 def kpi_strip(data: dict[str, pd.DataFrame],
               start_date: date, end_date: date) -> str:
     sp = data["system_prices"]
@@ -517,6 +599,7 @@ PAGE_TEMPLATE = """<!doctype html>
   <div class="chart-card">{fig_wholesale}</div>
   <div class="chart-card">{fig_bm}</div>
   {fig_ancillary}
+  {fig_stack}
 </main>
 <footer>Generated {generated_at} UTC · static HTML, no server required</footer>
 </body>
@@ -532,6 +615,12 @@ def main() -> None:
                     help="Width of the rolling window in days (default: 7)")
     ap.add_argument("--out", default="data/cache/dashboard.html",
                     help="Output HTML path")
+    ap.add_argument("--battery-mw", type=float, default=50.0,
+                    help="Battery power for the revenue-stack panel (MW)")
+    ap.add_argument("--battery-hours", type=float, default=2.0,
+                    help="Battery duration for the revenue-stack panel (h)")
+    ap.add_argument("--battery-rte", type=float, default=0.86,
+                    help="Round-trip efficiency for the revenue-stack panel")
     args = ap.parse_args()
 
     end_date = (date.fromisoformat(args.date) if args.date
@@ -575,11 +664,25 @@ def main() -> None:
                     'environment — run locally to populate.</p></div>')
         extra_sources = ""
 
+    cfg = BatteryConfig(power_mw=args.battery_mw,
+                         duration_h=args.battery_hours,
+                         round_trip_efficiency=args.battery_rte)
+    stack_fig, _, _ = _fig_revenue_stack(data, start_date, end_date, cfg)
+    if stack_fig is not None:
+        stack_html = ('<div class="chart-card">' +
+                       stack_fig.to_html(include_plotlyjs=False,
+                                          full_html=False,
+                                          div_id="dash-stack",
+                                          config={"displaylogo": False}) +
+                       '</div>')
+    else:
+        stack_html = ""
+
     html = PAGE_TEMPLATE.format(
         range_label=range_label, extra_sources=extra_sources,
         kpis=kpi_strip(data, start_date, end_date),
         fig_main=main_fig, fig_wholesale=wholesale_fig,
-        fig_bm=bm_fig, fig_ancillary=anc_html,
+        fig_bm=bm_fig, fig_ancillary=anc_html, fig_stack=stack_html,
         generated_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
     )
     out_path = Path(args.out)
