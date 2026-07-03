@@ -15,7 +15,11 @@ Sections rendered:
   rendered only when the NESO portal is reachable
 
 Usage:
-    python -m scripts.build_dashboard [--date YYYY-MM-DD] [--out file.html]
+    python -m scripts.build_dashboard [--date YYYY-MM-DD] [--days N]
+                                       [--out file.html]
+
+--date is the anchor (default: yesterday UTC). --days is the width of
+the rolling window ending on --date (default: 7).
 """
 from __future__ import annotations
 
@@ -61,14 +65,36 @@ def _safe(callable_, *args, **kwargs) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def fetch(target: date) -> dict[str, pd.DataFrame]:
+def fetch(start_date: date, end_date: date) -> dict[str, pd.DataFrame]:
+    """Pull the rolling window `[start_date, end_date]` inclusive.
+
+    Endpoints that only accept a single settlement date (system prices,
+    demand outturn) are looped per day and concatenated. Everything else
+    takes a from/to range natively.
+    """
     el = ElexonClient()
-    start = datetime(target.year, target.month, target.day, tzinfo=timezone.utc)
-    end = start + timedelta(days=1)
-    print(f"fetching for {target}...")
+    start = datetime(start_date.year, start_date.month, start_date.day,
+                     tzinfo=timezone.utc)
+    end = datetime(end_date.year, end_date.month, end_date.day,
+                   tzinfo=timezone.utc) + timedelta(days=1)
+    print(f"fetching {start_date} → {end_date} ({(end_date - start_date).days + 1} days)...")
+
+    # Per-day endpoints
+    days = pd.date_range(start_date, end_date, freq="D").date
+    sp_frames, dem_frames = [], []
+    for d in days:
+        sp_frames.append(_safe(el.system_prices, d))
+        dem_frames.append(_safe(el.demand_outturn, d))
+    system_prices = (pd.concat([f for f in sp_frames if not f.empty],
+                                ignore_index=True)
+                     if any(not f.empty for f in sp_frames) else pd.DataFrame())
+    demand = (pd.concat([f for f in dem_frames if not f.empty],
+                        ignore_index=True)
+              if any(not f.empty for f in dem_frames) else pd.DataFrame())
+
     out = {
-        "system_prices": _safe(el.system_prices, target),
-        "demand": _safe(el.demand_outturn, target),
+        "system_prices": system_prices,
+        "demand": demand,
         "generation": _safe(el.generation_by_fuel, start, end),
         "mid_epex": _safe(el.day_ahead_epex, start, end),
         "mid_n2ex": _safe(el.day_ahead_n2ex, start, end),
@@ -76,12 +102,13 @@ def fetch(target: date) -> dict[str, pd.DataFrame]:
         "boalf": _safe(el.bid_offer_acceptances, start, end),
     }
     # NESO ancillary auctions — single EAC summary feed covers all
-    # response / reserve products (DC, DM, DR, BR, QR, SR).
+    # response / reserve products (DC, DM, DR, BR, QR, SR). We fetch a
+    # 30-day trailing history so the 7-day mean bar chart has context.
     try:
         neso = NesoClient()
         out["eac"] = _safe(
             neso.eac_auction_results,
-            from_date=(target - timedelta(days=30)).isoformat(),
+            from_date=(start_date - timedelta(days=30)).isoformat(),
         )
     except Exception as exc:  # noqa: BLE001
         print(f"  WARN: NESO unreachable: {exc}")
@@ -91,7 +118,8 @@ def fetch(target: date) -> dict[str, pd.DataFrame]:
 
 # ----- chart helpers -------------------------------------------------------
 
-def _fig_price_demand_gen(data: dict[str, pd.DataFrame], target: date) -> go.Figure:
+def _fig_price_demand_gen(data: dict[str, pd.DataFrame],
+                            start_date: date, end_date: date) -> go.Figure:
     fig = make_subplots(
         rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.07,
         row_heights=[0.3, 0.3, 0.4],
@@ -148,8 +176,10 @@ def _fig_price_demand_gen(data: dict[str, pd.DataFrame], target: date) -> go.Fig
     fig.update_yaxes(title_text="GW", row=3, col=1)
     fig.update_xaxes(title_text="Time (UTC)", row=3, col=1,
                      rangeslider=dict(visible=True, thickness=0.04))
+    label = (f"{start_date}" if start_date == end_date
+             else f"{start_date} → {end_date}")
     fig.update_layout(
-        title=dict(text=f"<b>{target} — system, demand & generation</b>",
+        title=dict(text=f"<b>{label} — system, demand & generation</b>",
                     x=0.01, xanchor="left"),
         height=860, margin=dict(l=60, r=30, t=60, b=40),
         hovermode="x unified", legend=dict(orientation="h", y=-0.06,
@@ -379,17 +409,32 @@ def _fig_ancillary_summary(data: dict[str, pd.DataFrame]) -> go.Figure | None:
     return fig
 
 
-def kpi_strip(data: dict[str, pd.DataFrame], target: date) -> str:
+def kpi_strip(data: dict[str, pd.DataFrame],
+              start_date: date, end_date: date) -> str:
     sp = data["system_prices"]
     dem = data["demand"]
     gen = data["generation"]
     epex = data["mid_epex"]
+    days = (end_date - start_date).days + 1
 
     sells = sp.get("systemSellPrice", pd.Series(dtype=float)).dropna()
     p_mean = sells.mean() if len(sells) else float("nan")
     p_peak = sells.max() if len(sells) else float("nan")
     p_trough = sells.min() if len(sells) else float("nan")
-    spread = (p_peak - p_trough) if len(sells) else float("nan")
+
+    # Best daily arbitrage spread (mean top-4 vs bottom-4 SPs, ~2h battery)
+    daily_spread = float("nan")
+    if not sp.empty and "startTime" in sp.columns:
+        sp2 = sp.copy()
+        sp2["startTime"] = pd.to_datetime(sp2["startTime"], utc=True, errors="coerce")
+        sp2["day"] = sp2["startTime"].dt.date
+        spreads = []
+        for _, g in sp2.groupby("day"):
+            s = g["systemSellPrice"].dropna().sort_values()
+            if len(s) >= 8:
+                spreads.append(s.tail(4).mean() - s.head(4).mean())
+        if spreads:
+            daily_spread = sum(spreads) / len(spreads)
 
     epex_mean = pd.to_numeric(epex.get("price", pd.Series()), errors="coerce").mean() \
         if not epex.empty else float("nan")
@@ -406,10 +451,12 @@ def kpi_strip(data: dict[str, pd.DataFrame], target: date) -> str:
     else:
         ren_pct = float("nan")
 
+    prefix = f"{days}d" if days > 1 else "Day"
     cards = [
-        ("Day mean SIP", f"£{p_mean:,.0f}/MWh"),
-        ("Peak SIP", f"£{p_peak:,.0f}/MWh"),
-        ("Intraday spread", f"£{spread:,.0f}/MWh"),
+        (f"{prefix} mean SIP", f"£{p_mean:,.0f}/MWh"),
+        (f"{prefix} peak SIP", f"£{p_peak:,.0f}/MWh"),
+        (f"{prefix} trough SIP", f"£{p_trough:,.0f}/MWh"),
+        ("Avg daily 2h spread", f"£{daily_spread:,.0f}/MWh"),
         ("EPEX DA mean", f"£{epex_mean:,.0f}/MWh"),
         ("Peak ITSDO", f"{d_peak:,.1f} GW"),
         ("Avg renewables share", f"{ren_pct:.1f}%"),
@@ -426,7 +473,7 @@ PAGE_TEMPLATE = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>UK Power Markets — {target}</title>
+<title>UK Power Markets — {range_label}</title>
 <style>
   :root {{ --bg:#f7f9fc; --card:#fff; --text:#1f2d3d; --muted:#6b7c93;
     --accent:#2c3e50; --border:#e3e8ee; }}
@@ -462,7 +509,7 @@ PAGE_TEMPLATE = """<!doctype html>
 <body>
 <header>
   <h1>UK Power Markets Dashboard</h1>
-  <div class="sub">Settlement date {target} · Elexon BMRS Insights Solution{extra_sources}</div>
+  <div class="sub">{range_label} · Elexon BMRS Insights Solution{extra_sources}</div>
 </header>
 <main>
   {kpis}
@@ -480,16 +527,22 @@ PAGE_TEMPLATE = """<!doctype html>
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--date", default=None,
-                    help="Settlement date YYYY-MM-DD (default: yesterday UTC)")
+                    help="End date YYYY-MM-DD (default: yesterday UTC)")
+    ap.add_argument("--days", type=int, default=7,
+                    help="Width of the rolling window in days (default: 7)")
     ap.add_argument("--out", default="data/cache/dashboard.html",
                     help="Output HTML path")
     args = ap.parse_args()
 
-    target = (date.fromisoformat(args.date) if args.date
-              else (datetime.now(timezone.utc) - timedelta(days=1)).date())
-    data = fetch(target)
+    end_date = (date.fromisoformat(args.date) if args.date
+                else (datetime.now(timezone.utc) - timedelta(days=1)).date())
+    days = max(1, int(args.days))
+    start_date = end_date - timedelta(days=days - 1)
+    data = fetch(start_date, end_date)
+    range_label = (f"{end_date}" if start_date == end_date
+                   else f"{start_date} → {end_date} ({days} days)")
 
-    main_fig = _fig_price_demand_gen(data, target).to_html(
+    main_fig = _fig_price_demand_gen(data, start_date, end_date).to_html(
         include_plotlyjs="cdn", full_html=False, div_id="dash-main",
         config={"displaylogo": False})
     wholesale_fig = _fig_wholesale(data).to_html(
@@ -523,8 +576,8 @@ def main() -> None:
         extra_sources = ""
 
     html = PAGE_TEMPLATE.format(
-        target=target, extra_sources=extra_sources,
-        kpis=kpi_strip(data, target),
+        range_label=range_label, extra_sources=extra_sources,
+        kpis=kpi_strip(data, start_date, end_date),
         fig_main=main_fig, fig_wholesale=wholesale_fig,
         fig_bm=bm_fig, fig_ancillary=anc_html,
         generated_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
