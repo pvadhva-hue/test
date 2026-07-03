@@ -42,9 +42,21 @@ RESERVE_PRODUCTS = ("PBR", "NBR", "PQR", "NQR", "PSR", "NSR")
 
 @dataclass(frozen=True)
 class StackAssumptions:
-    ancillary_availability_pct: float = 1.0
-    imbalance_capture: float = 0.5
-    da_capture: float = 0.8
+    """Realistic capture rates for a GB 2h BESS operating a stacked strategy.
+
+    ancillary_availability_pct — the share of the battery's nameplate
+        MW that is committed to the highest-paying ancillary product at
+        any given time. The rest of the MW is free to run wholesale +
+        imbalance arbitrage. Modo Energy's 2025 GB BESS Index puts the
+        typical split around 40–50% ancillary / 50–60% wholesale.
+    da_capture — fraction of perfect-foresight DA arbitrage a real
+        optimiser catches (typically 0.5–0.6 for a 2h battery).
+    imbalance_capture — fraction of the (SIP − DA) daily uplift a real
+        BM strategy monetises (typically 0.3–0.5).
+    """
+    ancillary_availability_pct: float = 0.50
+    imbalance_capture: float = 0.4
+    da_capture: float = 0.60
     include_products: tuple[str, ...] = RESPONSE_PRODUCTS + RESERVE_PRODUCTS
 
 
@@ -175,15 +187,18 @@ def revenue_stack(
     start: date,
     end: date,
 ) -> pd.DataFrame:
-    """Return per-SP revenue by stream and the top-of-stack choice.
+    """Return per-SP revenue stacked additively across markets.
 
-    Columns:
-      sp_start, settlement_date, da_gbp, bm_gbp, arb_total_gbp,
-      ancillary_gbp, ancillary_product, chosen_market, chosen_gbp
+    A fraction ``ancillary_availability_pct`` of the battery's nameplate
+    MW earns ancillary capacity revenue at the best-clearing product for
+    that SP. The remaining fraction runs wholesale DA + BM arbitrage.
+    Only negative-clearing ancillary blocks are floored at zero — a real
+    optimiser would exit them.
     """
     assump = assumptions or StackAssumptions()
     sp_grid = _sp_grid(start, end)
 
+    # Full-battery arb baseline (bess service already applies MW * eta)
     da = _da_value_per_sp(da_prices, cfg, assump, sp_grid)
     bm = _bm_uplift_per_sp(sip_prices, da_prices, cfg, assump, sp_grid)
     anc = _ancillary_best_per_sp(eac, cfg, assump, sp_grid)
@@ -192,34 +207,31 @@ def revenue_stack(
         anc[["sp_start", "product", "clearingPrice", "ancillary_gbp"]],
         on="sp_start",
     )
-    df["arb_total_gbp"] = df["da_gbp"] + df["bm_gbp"]
-    df["chosen_market"] = np.where(
-        df["ancillary_gbp"] > df["arb_total_gbp"], "ancillary", "wholesale+bm"
-    )
-    df["chosen_gbp"] = np.maximum(df["ancillary_gbp"], df["arb_total_gbp"])
+
+    a = assump.ancillary_availability_pct
+    # Ancillary earnings only for positive clearing prices; negative
+    # blocks would be skipped by a real optimiser.
+    df["ancillary_gbp"] = (df["ancillary_gbp"].clip(lower=0)
+                             * a)
+    # DA / BM revenues scale with the fraction of MW left over
+    df["da_gbp"] = df["da_gbp"] * (1 - a)
+    df["bm_gbp"] = df["bm_gbp"] * (1 - a)
+    df["total_gbp"] = df["ancillary_gbp"] + df["da_gbp"] + df["bm_gbp"]
+
     df["settlement_date"] = (df["sp_start"] + pd.Timedelta(hours=1)).dt.date
     df = df[(df["settlement_date"] >= start) & (df["settlement_date"] <= end)]
     return df.rename(columns={"product": "ancillary_product"}).reset_index(drop=True)
 
 
 def daily_stack_summary(stack: pd.DataFrame) -> pd.DataFrame:
-    """Roll per-SP rows up to per-day totals split by which market won."""
+    """Roll per-SP rows up to per-day totals per market stream."""
     if stack.empty:
         return stack
-    grouped = stack.groupby("settlement_date")
-    out = grouped.agg(
+    out = stack.groupby("settlement_date").agg(
         sps=("sp_start", "count"),
-        sps_ancillary=("chosen_market",
-                        lambda s: int((s == "ancillary").sum())),
-        sps_wholesale=("chosen_market",
-                        lambda s: int((s == "wholesale+bm").sum())),
-    )
-    anc = stack[stack["chosen_market"] == "ancillary"] \
-        .groupby("settlement_date")["chosen_gbp"].sum().rename("ancillary_gbp")
-    ws = stack[stack["chosen_market"] == "wholesale+bm"]
-    da = ws.groupby("settlement_date")["da_gbp"].sum().rename("da_gbp")
-    bm = ws.groupby("settlement_date")["bm_gbp"].sum().rename("bm_gbp")
-    out = out.join([anc, da, bm], how="left").fillna(0)
-    out["total_gbp"] = out["ancillary_gbp"] + out["da_gbp"] + out["bm_gbp"]
-    out = out.reset_index().rename(columns={"settlement_date": "day"})
+        ancillary_gbp=("ancillary_gbp", "sum"),
+        da_gbp=("da_gbp", "sum"),
+        bm_gbp=("bm_gbp", "sum"),
+        total_gbp=("total_gbp", "sum"),
+    ).reset_index().rename(columns={"settlement_date": "day"})
     return out

@@ -415,9 +415,10 @@ def _fig_ancillary_summary(data: dict[str, pd.DataFrame]) -> go.Figure | None:
 
 def _fig_revenue_stack(data: dict[str, pd.DataFrame],
                         start_date: date, end_date: date,
-                        cfg: BatteryConfig) -> tuple[go.Figure | None,
-                                                       pd.DataFrame,
-                                                       pd.DataFrame]:
+                        cfg: BatteryConfig,
+                        assump: StackAssumptions) -> tuple[go.Figure | None,
+                                                             pd.DataFrame,
+                                                             pd.DataFrame]:
     """BESS revenue stack over the window: daily bars + product mix.
 
     Returns (figure, per-SP stack df, per-day summary df).
@@ -431,7 +432,6 @@ def _fig_revenue_stack(data: dict[str, pd.DataFrame],
     sip = data["system_prices"]
     eac = data.get("eac", pd.DataFrame())
 
-    assump = StackAssumptions(da_capture=0.8, imbalance_capture=0.5)
     stack = revenue_stack(da, sip, eac, cfg, assumptions=assump,
                            start=start_date, end=end_date)
     summary = daily_stack_summary(stack)
@@ -461,23 +461,28 @@ def _fig_revenue_stack(data: dict[str, pd.DataFrame],
     ), row=1, col=1)
 
     if not stack.empty:
-        mix = (stack[stack["chosen_market"] == "ancillary"]
-                ["ancillary_product"].value_counts())
+        # Ancillary revenue by product (only positive-clearing SPs get chosen)
+        winners = stack[stack["ancillary_gbp"] > 0]
+        mix = winners.groupby("ancillary_product")["ancillary_gbp"].sum() \
+                     .sort_values(ascending=False)
         colours = [PRODUCT_COLOURS.get(str(p), "#999") for p in mix.index]
         fig.add_trace(go.Pie(
             labels=mix.index, values=mix.values, hole=0.4,
             marker=dict(colors=colours),
             textinfo="label+percent",
-            hovertemplate="%{label}<br>%{value} settlement periods<extra></extra>",
+            hovertemplate="%{label}<br>£%{value:,.0f}<extra></extra>",
         ), row=1, col=2)
 
     total = summary["total_gbp"].sum()
     per_mw_day = total / cfg.power_mw / max(len(summary), 1)
     subtitle = (f"{cfg.power_mw:.0f} MW / {cfg.duration_h:g}h · "
                 f"η<sub>rt</sub>={cfg.round_trip_efficiency:.0%} · "
+                f"anc avail {assump.ancillary_availability_pct:.0%} · "
+                f"DA capture {assump.da_capture:.0%} · "
+                f"BM capture {assump.imbalance_capture:.0%}<br>"
                 f"7-day total £{total:,.0f} "
                 f"(£{per_mw_day:,.0f}/MW/day · "
-                f"~£{per_mw_day * 365 / 1000:,.0f}k/MW/yr extrapolated)")
+                f"~£{per_mw_day * 365 / 1000:,.0f}k/MW/yr annualised)")
     fig.update_layout(
         title=dict(text=f"<b>BESS revenue stack</b><br>"
                          f"<sup>{subtitle}</sup>",
@@ -621,6 +626,12 @@ def main() -> None:
                     help="Battery duration for the revenue-stack panel (h)")
     ap.add_argument("--battery-rte", type=float, default=0.86,
                     help="Round-trip efficiency for the revenue-stack panel")
+    ap.add_argument("--ancillary-avail", type=float, default=0.50,
+                    help="Fraction of MW committed to ancillary (0-1)")
+    ap.add_argument("--da-capture", type=float, default=0.60,
+                    help="Realised fraction of perfect-foresight DA arb (0-1)")
+    ap.add_argument("--bm-capture", type=float, default=0.40,
+                    help="Realised fraction of imbalance uplift (0-1)")
     args = ap.parse_args()
 
     end_date = (date.fromisoformat(args.date) if args.date
@@ -667,7 +678,12 @@ def main() -> None:
     cfg = BatteryConfig(power_mw=args.battery_mw,
                          duration_h=args.battery_hours,
                          round_trip_efficiency=args.battery_rte)
-    stack_fig, _, _ = _fig_revenue_stack(data, start_date, end_date, cfg)
+    assump = StackAssumptions(
+        ancillary_availability_pct=args.ancillary_avail,
+        da_capture=args.da_capture,
+        imbalance_capture=args.bm_capture,
+    )
+    stack_fig, _, _ = _fig_revenue_stack(data, start_date, end_date, cfg, assump)
     if stack_fig is not None:
         stack_html = ('<div class="chart-card">' +
                        stack_fig.to_html(include_plotlyjs=False,
